@@ -4,7 +4,7 @@ A relatively modest repository to create and read sharded matrices, as well as p
 
 Simple Example:
 
-```
+```Python
 from sharded_matrix import ShardedWriter, ShardedLoader
 import numpy as np
 
@@ -14,7 +14,10 @@ with ShardedWriter('test', dtype=np.int8, shape=(128, 128)) as writer:
     x = np.zeros((99, 128, 128), dtype=np.int8)
     writer.write_many(x)
 
-# Creates 2 files: "test-00000.sm" and "test-00001.sm"
+
+# There are now 2 files: "test-00000.sm" and "test-00001.sm"
+
+
 # Read the matrix, shard-by-shard.
 loader = ShardedLoader('test')
 for a in loader.iterator():
