@@ -1,6 +1,6 @@
 # Sharded Matrix
 
-A relatively modest repository to creating and reading sharded matrices, as well as performing some primitive operations on them.
+A relatively modest repository to create and read sharded matrices, as well as perform some operations on them.
 
 Simple Example:
 
@@ -30,7 +30,7 @@ for a in loader.iterator():
 
 Notworthy features:
 
-1. Multi-process inner product compuation that splits the work across the sharded files. Notably this is enough to support
+1. Multi-process inner-product computation that splits the work across the sharded files. Notably this is enough to support...
 
 2. Parallelized linear regression. Even if your dataset doesn't fit into memory, if you can invert a DxD matrix, then you can perform the linear regression.
 
