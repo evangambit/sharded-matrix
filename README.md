@@ -31,8 +31,17 @@ for a in loader.iterator():
 
 Notworthy features:
 
-1. Multi-process inner-product computation that splits the work across the sharded files. Notably this is enough to support...
+1. Creating matrices with C++
 
-2. Parallelized linear regression. Even if your dataset doesn't fit into memory, if you can invert a DxD matrix, then you can perform the linear regression.
+2. *Multi-process* inner-product computation. Notably this is enough to support...
+
+3. Parallelized linear regression. Even if your dataset doesn't fit into memory, if you can invert a DxD matrix, then you can perform the linear regression.
+
+```Python
+import sharded_matrix
+X = sharded_matrix.ShardedLoader('X')
+Y = sharded_matrix.ShardedLoader('Y')
+w = sharded_matrix.linear_regression(X, Y)
+```
 
 2. Boolean matrices are packed (i.e. 8x smaller on disk), however each row must be a multiple of 8.
