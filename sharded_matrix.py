@@ -37,17 +37,11 @@ kType2SizeBits = {
   bool:     1,
 }
 
-class LoaderInterface:
-  def iterator(self, skip, offset):
-    raise NotImplementedError()
-
 def path2shardname(path, i):
-  return f'{path}-{str(i).rjust(5, "0")}'
+  return f'{path}-{str(i).rjust(5, "0")}.sm'
 
 def product(x):
   return np.prod(x)
-
-kTargetedShardSizeBytes = 25_000_000  # 25 MB
 
 def tensor2bytes(A):
   if A.dtype == bool:
@@ -62,19 +56,21 @@ def bytes2tensor(A, dtype, shape):
     return np.frombuffer(A, dtype=dtype).reshape(shape)
 
 class ShardedWriter:
-  def __init__(self, path: str, dtype: type, shape: tuple[int]) -> None:
+  def __init__(self, path: str, dtype: type, shape: tuple[int], shard_size: int = 25_000_000) -> None:
     assert dtype in kSupportedTypes
     assert len(shape) > 0, 'At least one dimension must be provided'
     for d in shape:
       assert d > 0, 'All dimensions must be greater than 0'
+    if dtype == bool:
+      assert product(shape) % 8 == 0, 'Number of boolean elements per row must be a multiple of 8'
     self.path = path
     self.dtype = dtype
     self.shape = shape
     self.shard_index = 0
     self.bytes_per_row = product(self.shape) * kType2SizeBits[self.dtype] // 8
-    self.rows_per_shard = kTargetedShardSizeBytes // self.bytes_per_row
+    self.rows_per_shard = shard_size // self.bytes_per_row
     self.bytes_per_shard = self.rows_per_shard * self.bytes_per_row
-    assert self.rows_per_shard > 16, 'Shape is too big :('
+    assert self.rows_per_shard >= 1, 'Shape is too big :('
     self._i = 0
     self._data_to_write = bytearray(self.rows_per_shard * self.bytes_per_row)
 
@@ -97,20 +93,21 @@ class ShardedWriter:
       return
     assert x.shape[1:] == self.shape, f'Expected shape {self.shape}, got {x.shape[1:]}'
     x = x.astype(self.dtype)
-    di = x.shape[0] * self.bytes_per_row
+    delta_bytes = x.shape[0] * self.bytes_per_row
 
-    if self._i + di <= self.bytes_per_shard:
-      self._data_to_write[self._i:self._i+di] = tensor2bytes(x)
-      self._i += di
+    while self._i + delta_bytes > self.bytes_per_shard:
+      bytes_left = self.bytes_per_shard - self._i
+      rows_left = bytes_left // self.bytes_per_row
+      assert rows_left * self.bytes_per_row == bytes_left
+      self._data_to_write[self._i:] = tensor2bytes(x[:bytes_left])
+      self._dump_data(self.rows_per_shard)
+      x = x[rows_left:]
+      delta_bytes = x.shape[0] * self.bytes_per_row
+
+    if self._i + delta_bytes <= self.bytes_per_shard:
+      self._data_to_write[self._i:self._i+delta_bytes] = tensor2bytes(x)
+      self._i += delta_bytes
       return
-  
-    bytes_left = self.bytes_per_shard - self._i
-    rows_left = bytes_left // self.bytes_per_row
-    assert rows_left * self.bytes_per_row == bytes_left
-    self._data_to_write[self._i:] = tensor2bytes(x[:bytes_left])
-    self._dump_data(self.rows_per_shard)
-
-    self.write_many(x[rows_left:])
   
   def _dump_data(self, num_rows):
     with open(path2shardname(self.path, self.shard_index), 'wb') as f:
@@ -121,14 +118,6 @@ class ShardedWriter:
       f.write(self._data_to_write[:num_rows*self.bytes_per_row])
     self._i = 0
     self.shard_index += 1
-
-def dump_shard(path, num_rows):
-  with open(path, 'wb') as f:
-      f.write(kType2ByteEncoding[self.dtype])
-      f.write(np.array(len(self.shape) + 1, dtype=np.int32).tobytes())
-      for d in (num_rows,) + self.shape:
-        f.write(np.array(d, dtype=np.int32).tobytes())
-      f.write(self._data_to_write[:num_rows*self.bytes_per_row])
 
 def load_shard(path):
   with open(path, 'rb') as f:
@@ -141,20 +130,34 @@ def load_shard(path):
     if dtype != bool:
       data = bytes2tensor(f.read(), dtype, shape)
     else:
-      raise NotImplementedError('')
+      data = np.unpackbits(np.frombuffer(f.read(), dtype=np.uint8), bitorder='little')
     return data.reshape(shape)
 
-class BaseShardedLoader(LoaderInterface):
+class LoaderInterface:
+  def __init__(self) -> None:
+    self.dtype = None
+    self.shape = None
+    self.num_shards = None
+
+  def iterator(self, skip, offset):
+    raise NotImplementedError()
+
+class ShardedLoader(LoaderInterface):
   def __init__(self, path: str):
     self._path = path
     self._last_loaded = (None, None)
-    self.n = 0
-    while os.path.exists(path2shardname(self._path, self.n)):
-      self.n += 1
-    assert self.n > 0
+    self.num_shards = 0
+    while os.path.exists(path2shardname(self._path, self.num_shards)):
+      self.num_shards += 1
+    assert self.num_shards > 0
+
+    A = next(self.iterator(0, 0))
+    self.dtype = A.dtype
+    self.shape = A.shape[1:]
+    self.rows_per_shard = A.shape[0]
   
   def iterator(self, offset=0, skip=1):
-    for shard_index in range(0, self.n, skip):
+    for shard_index in range(0, self.num_shards, skip):
       path = path2shardname(self._path, shard_index)
       if not os.path.exists(path):
         raise FileExistsError(path)
@@ -167,9 +170,9 @@ class BaseShardedLoader(LoaderInterface):
 
 class MappingLoader(LoaderInterface):
   def __init__(self, loader, *mappings, width=None):
-    self.rows_per_shard = loader.rows_per_shard
-    self.width = width if width is not None else loader.width
-    self.n = loader.n
+    self.dtype = loader.dtype
+    self.shape = loader.shape
+    self.num_shards = loader.num_shards
     self._loader = loader
     self._mappings = mappings
   
@@ -218,3 +221,13 @@ def compute_inner_product(loader1: LoaderInterface, loader2: LoaderInterface, we
       else:
         inner_products = pool.starmap(_compute_weighted_innerproduct, [(loader1, loader2, weights_loader, offset) for offset in shards])
     return sum(inner_products)
+
+def linear_regression(X: ShardedLoader, Y, weights=None, regularization: float = 0.0):
+  assert len(X.shape) == 1
+  assert len(Y.shape) == 1
+  assert X.num
+  cov = compute_inner_product(X, X)
+  if regularization > 0.0:
+    cov += np.eye(cov.shape[0]) * regularization
+  dot_product = compute_inner_product(X, Y, weights_loader=weights)
+  return np.linalg.solve(cov, dot_product)
