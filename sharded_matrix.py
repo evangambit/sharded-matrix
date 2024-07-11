@@ -56,7 +56,7 @@ def bytes2tensor(A, dtype, shape):
     return np.frombuffer(A, dtype=dtype).reshape(shape)
 
 class ShardedWriter:
-  def __init__(self, path: str, dtype: type, shape: tuple[int], shard_size: int = 25_000_000) -> None:
+  def __init__(self, path: str, dtype: type, shape: tuple[int], shard_size_bytes: int = 25_000_000) -> None:
     assert dtype in kSupportedTypes
     assert len(shape) > 0, 'At least one dimension must be provided'
     for d in shape:
@@ -68,7 +68,7 @@ class ShardedWriter:
     self.shape = shape
     self.shard_index = 0
     self.bytes_per_row = product(self.shape) * kType2SizeBits[self.dtype] // 8
-    self.rows_per_shard = shard_size // self.bytes_per_row
+    self.rows_per_shard = shard_size_bytes // self.bytes_per_row
     self.bytes_per_shard = self.rows_per_shard * self.bytes_per_row
     assert self.rows_per_shard >= 1, 'Shape is too big :('
     self._i = 0
@@ -119,14 +119,18 @@ class ShardedWriter:
     self._i = 0
     self.shard_index += 1
 
+def _load_shard_header(f):
+  dtype = f.read(4)
+  assert dtype in kByteEncodingToType, f'Unsupported type {dtype}'
+  dtype = kByteEncodingToType[dtype]
+  ndim = np.frombuffer(f.read(4), dtype=np.int32)[0]
+  assert ndim > 0, f'Invalid number of dimensions {ndim}'
+  shape = np.frombuffer(f.read(4 * ndim), dtype=np.int32)
+  return dtype, shape
+
 def load_shard(path):
   with open(path, 'rb') as f:
-    dtype = f.read(4)
-    assert dtype in kByteEncodingToType, f'Unsupported type {dtype}'
-    dtype = kByteEncodingToType[dtype]
-    ndim = np.frombuffer(f.read(4), dtype=np.int32)[0]
-    assert ndim > 0, f'Invalid number of dimensions {ndim}'
-    shape = np.frombuffer(f.read(4 * ndim), dtype=np.int32)
+    dtype, shape = _load_shard_header(f)
     if dtype != bool:
       data = bytes2tensor(f.read(), dtype, shape)
     else:
@@ -151,10 +155,11 @@ class ShardedLoader(LoaderInterface):
       self.num_shards += 1
     assert self.num_shards > 0
 
-    A = next(self.iterator(0, 0))
-    self.dtype = A.dtype
-    self.shape = A.shape[1:]
-    self.rows_per_shard = A.shape[0]
+    with open(path2shardname(self._path, 0), 'rb') as f:
+      dtype, shape = _load_shard_header(f)
+    self.dtype = dtype
+    self.shape = shape[1:]
+    self.rows_per_shard = shape[0]
   
   def iterator(self, offset=0, skip=1):
     for shard_index in range(0, self.num_shards, skip):
