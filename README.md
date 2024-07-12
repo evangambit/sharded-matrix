@@ -1,11 +1,11 @@
 # Sharded Matrix
 
-A relatively modest repository to create and read sharded matrices, as well as perform some operations on them.
+Python code to read/write/compute with sharded matrices.
 
 Simple Example:
 
 ```Python
-from sharded_matrix import ShardedWriter, ShardedLoader
+from sharded_matrix import ShardedWriter, ShardedLoader, linear_regression
 import numpy as np
 
 # Write a 2970x128x128 tensor, 99 at a time.
@@ -27,21 +27,10 @@ for a in loader.iterator():
 # (1525, 128, 128)
 # (1445, 128, 128)
 
-```
-
-Notworthy features:
-
-1. Creating matrices with C++
-
-2. *Multi-process* inner-product computation. Notably this is enough to support...
-
-3. Parallelized linear regression. Even if your dataset doesn't fit into memory, if you can invert a DxD matrix, then you can perform the linear regression.
-
-```Python
-import sharded_matrix
+# Perform linear regression using multiple processes
 X = sharded_matrix.ShardedLoader('X')
 Y = sharded_matrix.ShardedLoader('Y')
 w = sharded_matrix.linear_regression(X, Y)
 ```
 
-2. Boolean matrices are packed (i.e. 8x smaller on disk), however each row must be a multiple of 8.
+Also includes a C++ library for creating matrices
