@@ -3,21 +3,6 @@
 #include <cstdint>
 #include <vector>
 
-
-// General matrix format is
-
-// type: <4 bytes>  // type ("bool", "i8  ", "u16 ", etc.)
-//     <4 bytes>  // number of dimensions
-//     <4 bytes>  // size of dimension 1  (number of rows)
-//     <4 bytes>  // size of dimension 2
-//     ...
-//     [DATA]
-//     ...
-
-
-// def path2shardname(path, i):
-//   return f'{path}-{str(i).rjust(5, "0")}.sm'
-
 std::string path2shardname(const std::string& path, int i) {
   std::string n = std::to_string(i);
   return path + "-" + std::string(5 - n.size(), '0') + n + ".sm";
@@ -45,19 +30,13 @@ public:
   std::ofstream file;
   ShardedWriter(const std::string& filename, const std::vector<uint32_t>& dims)
   : filename(filename), dims(dims),
-    shardCounter(0), rowCounter(0),
+    shardCounter(-1), rowCounter(0),
     bytesPerRow(product(dims) * sizeof(T)),
     rowsPerShard(kShardSizeBytes / (product(dims) * sizeof(T))) {
     if (this->rowsPerShard == 0) {
       throw std::runtime_error("Shard size is too small");
     }
-    file.open(path2shardname(filename, 0), std::ios::binary | std::ios::out);
-    const std::string typeCode = ShardedWriter<T>::type_code();
-    const uint32_t numDims = dims.size() + 1;
-    file.write((char *)(typeCode.data()), 4);
-    file.write((char *)(&numDims), sizeof(uint32_t));
-    file.write((char *)(&rowCounter), sizeof(uint32_t));
-    file.write((char *)(dims.data()), dims.size() * sizeof(uint32_t));
+    this->_init_file();
   }
 
   static std::string type_code();
@@ -67,20 +46,31 @@ public:
     if (++rowCounter >= this->rowsPerShard) {
       this->_close();
       rowCounter = 0;
-      file.open(path2shardname(filename, ++shardCounter), std::ios::binary | std::ios::out);
-      const std::string typeCode = ShardedWriter<T>::type_code();
-      const uint32_t numDims = dims.size() + 1;
-      file.write((char *)(typeCode.data()), 4);
-      file.write((char *)(&numDims), sizeof(uint32_t));
-      file.write((char *)(&rowCounter), sizeof(uint32_t));
-      file.write((char *)(dims.data()), dims.size() * sizeof(uint32_t));
+      this->_init_file();
     }
+  }
+
+  void _init_file() {
+    std::string path = path2shardname(filename, ++shardCounter);
+    std::cout << path << std::endl;
+    file.open(path, std::ios::binary | std::ios::out);
+    const std::string typeCode = ShardedWriter<T>::type_code();
+    const uint32_t numDims = dims.size() + 1;
+    file.write((char *)(typeCode.data()), 4);
+    file.write((char *)(&numDims), sizeof(uint32_t));
+    file.write((char *)(&rowCounter), sizeof(uint32_t));
+    file.write((char *)(dims.data()), dims.size() * sizeof(uint32_t));
+  }
+
+  ~ShardedWriter() {
+    this->_close();
   }
 
   void _close() {
     file.seekp(8);
     file.write((const char*)(&rowCounter), sizeof(uint32_t));
     file.close();
+    rowCounter = 0;
   }
 
   void _write_row(const T *const row) {
@@ -116,21 +106,16 @@ std::string ShardedWriter<bool>::type_code() {
 template<>
 ShardedWriter<bool>::ShardedWriter(const std::string& filename, const std::vector<uint32_t>& dims)
   : filename(filename), dims(dims),
-  shardCounter(0), bytesPerRow(product(dims) / 8),
+  shardCounter(-1), rowCounter(0),
+  bytesPerRow(product(dims) / 8),
   rowsPerShard(kShardSizeBytes / (product(dims) / 8)) {
   if (this->rowsPerShard == 0) {
     throw std::runtime_error("Shard size is too small");
   }
-  if (product(dims) != 8) {
-    throw std::runtime_error("bool matrix must have 8 elements per row");
+  if (product(dims) % 8 != 0) {
+    throw std::runtime_error("Boolean array size must be a multiple of 8");
   }
-  file.open(path2shardname(filename, 0), std::ios::binary | std::ios::out);
-  const std::string typeCode = ShardedWriter<bool>::type_code();
-  const uint32_t numDims = dims.size() + 1;
-  file.write((char *)(typeCode.data()), 4);
-  file.write((char *)(&numDims), sizeof(uint32_t));
-  file.write((char *)(&rowCounter), sizeof(uint32_t));
-  file.write((char *)(dims.data()), dims.size() * sizeof(uint32_t));
+  this->_init_file();
 }
 
 template<>
