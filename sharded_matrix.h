@@ -52,7 +52,6 @@ public:
 
   void _init_file() {
     std::string path = path2shardname(filename, ++shardCounter);
-    std::cout << path << std::endl;
     file.open(path, std::ios::binary | std::ios::out);
     const std::string typeCode = ShardedWriter<T>::type_code();
     const uint32_t numDims = dims.size() + 1;

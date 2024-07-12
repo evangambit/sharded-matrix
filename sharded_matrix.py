@@ -180,7 +180,11 @@ class ShardedLoader(LoaderInterface):
     self.rows_per_shard = shape[0]
   
   def load_shard(self, shard_index):
-    return load_shard(path2shardname(self._path, shard_index))
+    if self._last_loaded[0] == shard_index:
+      return self._last_loaded[1]
+    tensor = load_shard(path2shardname(self._path, shard_index))
+    self._last_loaded = (shard_index, tensor)
+    return tensor
   
   def shard_to_slice_indices(self, shard_index):
     start = self.cumsum_rows[shard_index - 1] if shard_index > 0 else 0
@@ -215,11 +219,7 @@ class ShardedLoader(LoaderInterface):
       path = path2shardname(self._path, shard_index)
       if not os.path.exists(path):
         raise FileExistsError(path)
-      if self._last_loaded[0] == path:
-        # Caching is useful when weights are derived from the same data that is being multiplied
-        yield self._last_loaded[1]
       matrix = load_shard(path)
-      self._last_loaded = (path, matrix)
       yield matrix
 
 class MappingLoader(LoaderInterface):
