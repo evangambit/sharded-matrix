@@ -241,7 +241,7 @@ class MappingLoader(LoaderInterface):
     return self._loader.shard_to_slice_indices(shard_index)
 
   def load_slice(self, start, end):
-    return self._apply(self._apply(self._loader.load_slice(start, end)))
+    return self._apply(self._loader.load_slice(start, end))
   
   def _apply(self, x):
     for f in self._mappings:
