@@ -316,12 +316,3 @@ def linear_regression(X: LoaderInterface, Y: LoaderInterface, weights=None, regu
     cov += np.eye(cov.shape[0]) * regularization
   dot_product = compute_inner_product(X, Y, weights_loader=weights)
   return np.linalg.solve(cov, dot_product)
-
-def foo(x):
-  return x[:,:-8].reshape((x.shape[0], 12, 8, 8)).sum((2, 3))
-
-if __name__ == '__main__':
-  X = ShardedLoader('data/a-table')
-  Y = ShardedLoader('data/a-eval')
-  A = MappingLoader(X, foo)
-  w = linear_regression(A, Y, regularization=1.0)
