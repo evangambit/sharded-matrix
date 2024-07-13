@@ -202,7 +202,7 @@ public:
 
   /** Each thread should call this to get its own writer. */
   std::shared_ptr<Writer<T>> new_shard_writer() {
-    return std::shared_ptr<Writer<T>>(new Writer<T>(dims, &(this->writerDelegate_)));
+    return std::shared_ptr<Writer<T>>(new Writer<T>(dims_, &(this->writerDelegate_)));
   }
 private:
   const std::vector<uint32_t> dims_;
