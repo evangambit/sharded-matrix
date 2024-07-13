@@ -3,6 +3,10 @@
 #include <cstdint>
 #include <vector>
 
+/**
+ * TODO: take advantage of sharded matrices to support multi-threading.
+ */
+
 std::string path2shardname(const std::string& path, int i) {
   std::string n = std::to_string(i);
   return path + "-" + std::string(5 - n.size(), '0') + n + ".sm";

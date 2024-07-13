@@ -1,3 +1,11 @@
+"""
+Module to load, write, and perform basic linear operations on sharded matrices.
+
+Useful for matrices that are too large to fit into memory, or when you want to
+do computations using multiple processes.
+
+Source: https://github.com/evangambit/sharded-matrix
+"""
 
 import multiprocessing
 import os
@@ -280,7 +288,7 @@ def _compute_weighted_self_innerproduct(loader1, weights_loader, offset):
   A = A * weights
   return A.T @ A
 
-def compute_inner_product(loader1: LoaderInterface, loader2: LoaderInterface, weights_loader=None):
+def compute_inner_product(loader1: LoaderInterface, loader2: LoaderInterface, weights_loader=None, num_workers: int = 4):
   assert loader1.num_rows == loader2.num_rows, 'Both loaders must have the same number of shards'
 
   # Make loader1 the bigger loader. We'll be loading loader1 chunk-by-chunk and loader2 by slicing.
@@ -290,7 +298,7 @@ def compute_inner_product(loader1: LoaderInterface, loader2: LoaderInterface, we
 
   shards = list(range(0, loader1.num_shards))
   result = None
-  with multiprocessing.Pool(4) as pool:
+  with multiprocessing.Pool(num_workers) as pool:
     if loader1 is loader2:
       if weights_loader is None:
         inner_products = pool.starmap(_compute_self_innerproduct, [(loader1, offset) for offset in shards])
@@ -307,12 +315,13 @@ def compute_inner_product(loader1: LoaderInterface, loader2: LoaderInterface, we
       result = result.T
     return result
 
-def linear_regression(X: LoaderInterface, Y: LoaderInterface, weights=None, regularization: float = 0.0):
+def linear_regression(X: LoaderInterface, Y: LoaderInterface, weights=None, regularization: float = 0.0, num_workers: int = 4):
   assert len(X.shape) == 1
   assert len(Y.shape) == 1
   assert X.num_rows == Y.num_rows
-  cov = compute_inner_product(X, X)
+  assert num_workers > 0
+  cov = compute_inner_product(X, X, num_workers=num_workers)
   if regularization > 0.0:
     cov += np.eye(cov.shape[0]) * regularization
-  dot_product = compute_inner_product(X, Y, weights_loader=weights)
+  dot_product = compute_inner_product(X, Y, weights_loader=weights, num_workers=num_workers)
   return np.linalg.solve(cov, dot_product)
