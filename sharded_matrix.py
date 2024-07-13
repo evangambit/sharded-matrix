@@ -9,7 +9,7 @@ Source: https://github.com/evangambit/sharded-matrix
 
 import multiprocessing
 import os
-import time
+from functools import lru_cache
 
 import numpy as np
 
@@ -84,10 +84,10 @@ class ShardedWriter:
 
   def write(self, x: np.ndarray):
     self.write_many(x.reshape((1,) + x.shape))
-  
+
   def __enter__(self):
     return self
-  
+
   def __exit__(self, type, value, tb):
     self.close()
 
@@ -116,7 +116,7 @@ class ShardedWriter:
       self._data_to_write[self._i:self._i+delta_bytes] = tensor2bytes(x)
       self._i += delta_bytes
       return
-  
+
   def _dump_data(self, num_rows):
     with open(path2shardname(self.path, self.shard_index), 'wb') as f:
       f.write(kType2ByteEncoding[self.dtype])
@@ -161,13 +161,9 @@ class LoaderInterface:
   def load_slice(self, start, end) -> np.ndarray:
     raise NotImplementedError()
 
-  def iterator(self, skip, offset):
-    raise NotImplementedError()
-
 class ShardedLoader(LoaderInterface):
   def __init__(self, path: str):
     self._path = path
-    self._last_loaded = (None, None)
     self.num_shards = 0
 
     self.num_rows = 0
@@ -186,19 +182,16 @@ class ShardedLoader(LoaderInterface):
     self.dtype = dtype
     self.shape = tuple(shape[1:])
     self.rows_per_shard = shape[0]
-  
+
+  @lru_cache(maxsize=1)
   def load_shard(self, shard_index):
-    if self._last_loaded[0] == shard_index:
-      return self._last_loaded[1]
-    tensor = load_shard(path2shardname(self._path, shard_index))
-    self._last_loaded = (shard_index, tensor)
-    return tensor
-  
+    return load_shard(path2shardname(self._path, shard_index))
+
   def shard_to_slice_indices(self, shard_index):
     start = self.cumsum_rows[shard_index - 1] if shard_index > 0 else 0
     end = self.cumsum_rows[shard_index]
     return start, end
-  
+
   def load_slice(self, start, end):
     assert end > start, 'End index must be greater than start index'
     assert start < self.cumsum_rows[-1], 'Start index is out of bounds'
@@ -214,21 +207,13 @@ class ShardedLoader(LoaderInterface):
       else:
         start_offset = start - self.cumsum_rows[shard_index - 1]
         end_offset = end - self.cumsum_rows[shard_index - 1]
-      
+
       start_offset = max(0, start_offset)
       end_offset = min(shard.shape[0], end_offset)
-      
+
       R.append(shard[start_offset:end_offset])
-    
+
     return np.concatenate(R, 0)
-  
-  def iterator(self, offset=0, skip=1):
-    for shard_index in range(0, self.num_shards, skip):
-      path = path2shardname(self._path, shard_index)
-      if not os.path.exists(path):
-        raise FileExistsError(path)
-      matrix = load_shard(path)
-      yield matrix
 
 class MappingLoader(LoaderInterface):
   def __init__(self, loader: LoaderInterface, *mappings, width=None):
@@ -241,7 +226,8 @@ class MappingLoader(LoaderInterface):
     self.shape = tuple(self._apply(np.ones((1,) + loader.shape) * 0.5).shape[1:])
     self.num_shards = loader.num_shards
     self.num_rows = loader.num_rows    
-  
+
+  @lru_cache(maxsize=1)
   def load_shard(self, shard_index):
     return self._apply(self._loader.load_shard(shard_index))
 
@@ -250,18 +236,42 @@ class MappingLoader(LoaderInterface):
 
   def load_slice(self, start, end):
     return self._apply(self._loader.load_slice(start, end))
-  
+
   def _apply(self, x):
     for f in self._mappings:
       x = f(x)
     return x
-    
-  
-  def iterator(self, offset=0, skip=1):
-    for x in self._loader.iterator(offset=offset, skip=skip):
-      for f in self._mappings:
-        x = f(x)
-      yield x
+
+class RowMapper(LoaderInterface):
+  def __init__(self, f, *loaders):
+    super().__init__()
+    self._loaders = loaders
+    self._f = f
+
+    result = self._f(*[loader.load_slice(0, 1) for loader in self._loaders])
+
+    self.dtype = result.dtype
+    self.shape = tuple(result.shape[1:])
+    self.num_shards = loaders[0].num_shards
+    self.num_rows = loaders[0].num_rows
+    for loader in loaders[1:]:
+      assert loader.num_rows == self.num_rows, 'All loaders must have the same number of rows'
+
+  def load_shard(self, shard_index):
+    indices = self._loaders[0].shard_to_slice_indices(shard_index)
+    A = [
+      self._loaders[0].load_shard(shard_index)
+    ]
+    for loader in self._loaders[1:]:
+      A.append(loader.load_slice(*indices))
+    return self._f(*A)
+
+  def shard_to_slice_indices(self, shard_index):
+    return self._loaders[0].shard_to_slice_indices(shard_index)
+
+  def load_slice(self, start, end):
+    A = [l.load_slice(start, end) for l in self._loaders]
+    return self._f(*A)
 
 def _compute_innerproduct(loader1, loader2, offset):
   shard = loader1.load_shard(offset).astype(np.float32)
