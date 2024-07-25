@@ -49,7 +49,7 @@ def path2shardname(path, i):
   return f'{path}-{str(i).rjust(5, "0")}.sm'
 
 def product(x):
-  return np.prod(x)
+  return int(np.prod(x))
 
 def tensor2bytes(A):
   if A.dtype == bool:
@@ -65,8 +65,10 @@ def bytes2tensor(A, dtype, shape):
 
 class ShardedWriter:
   def __init__(self, path: str, dtype: type, shape: tuple[int], shard_size_bytes: int = 25_000_000) -> None:
-    assert dtype in kSupportedTypes
-    assert len(shape) > 0, 'At least one dimension must be provided'
+    if dtype not in kSupportedTypes and hasattr(dtype, 'type'):
+      dtype = dtype.type
+    assert dtype in kSupportedTypes, f'Unsupported type {dtype}'
+    # assert len(shape) > 0, 'At least one dimension must be provided'
     for d in shape:
       assert d > 0, 'All dimensions must be greater than 0'
     if dtype == bool:
@@ -84,10 +86,10 @@ class ShardedWriter:
 
   def write(self, x: np.ndarray):
     self.write_many(x.reshape((1,) + x.shape))
-
+  
   def __enter__(self):
     return self
-
+  
   def __exit__(self, type, value, tb):
     self.close()
 
@@ -116,7 +118,7 @@ class ShardedWriter:
       self._data_to_write[self._i:self._i+delta_bytes] = tensor2bytes(x)
       self._i += delta_bytes
       return
-
+  
   def _dump_data(self, num_rows):
     with open(path2shardname(self.path, self.shard_index), 'wb') as f:
       f.write(kType2ByteEncoding[self.dtype])
@@ -132,8 +134,11 @@ def _load_shard_header(f):
   assert dtype in kByteEncodingToType, f'Unsupported type {dtype}'
   dtype = kByteEncodingToType[dtype]
   ndim = np.frombuffer(f.read(4), dtype=np.int32)[0]
-  assert ndim > 0, f'Invalid number of dimensions {ndim}'
-  shape = np.frombuffer(f.read(4 * ndim), dtype=np.int32)
+  assert ndim >= 0, f'Invalid number of dimensions {ndim}'
+  if ndim > 0:
+    shape = np.frombuffer(f.read(4 * ndim), dtype=np.int32)
+  else:
+    shape = ()
   return dtype, shape
 
 def load_shard(path):
@@ -144,6 +149,9 @@ def load_shard(path):
     else:
       data = np.unpackbits(np.frombuffer(f.read(), dtype=np.uint8), bitorder='little')
     return data.reshape(shape)
+
+def reshape(a, shape):
+  return a.reshape(shape)
 
 class LoaderInterface:
   def __init__(self) -> None:
@@ -161,42 +169,68 @@ class LoaderInterface:
   def load_slice(self, start, end) -> np.ndarray:
     raise NotImplementedError()
 
+  def reshape(self, shape):
+    assert product(shape) == product(self.shape)
+    return RowMapper(curry(reshape, (-1,) + shape), self)
+  
+  def num_rows_in_shards(self):
+    result = []
+    for shard in range(self.num_shards):
+      start, end = self.shard_to_slice_indices(shard)
+      result.append(end - start)
+    return tuple(result)
+  
+  def save(self, path, force=None, dtype=None):
+    if dtype == None:
+      dtype = self.dtype
+    if not force:
+      assert not os.path.exists(path2shardname(path, 0))
+    else:
+      i = 0
+      while os.path.exists(path2shardname(path, i)):
+        os.remove(path2shardname(path, i))
+        i += 1
+    
+    with ShardedWriter(path, shape=self.shape, dtype=dtype) as w:
+      for shard in range(self.num_shards):
+        w.write_many(self.load_shard(shard))
+    
+
 class ShardedLoader(LoaderInterface):
   def __init__(self, path: str):
     self._path = path
     self.num_shards = 0
 
     self.num_rows = 0
-    self.num_rows_in_shards = []
+    num_rows_in_shards = []
     while os.path.exists(path2shardname(self._path, self.num_shards)):
       with open(path2shardname(self._path, self.num_shards), 'rb') as f:
         dtype, shape = _load_shard_header(f)
-        self.num_rows_in_shards.append(shape[0])
+        num_rows_in_shards.append(shape[0])
         self.num_rows += shape[0]
       self.num_shards += 1
     assert self.num_shards > 0
 
-    self.num_rows_in_shards = np.array(self.num_rows_in_shards, dtype=np.int64)
-    self.cumsum_rows = np.cumsum(self.num_rows_in_shards)
+    self._cumsum_rows = np.cumsum(num_rows_in_shards)
 
     self.dtype = dtype
     self.shape = tuple(shape[1:])
     self.rows_per_shard = shape[0]
-
+  
   @lru_cache(maxsize=1)
   def load_shard(self, shard_index):
     return load_shard(path2shardname(self._path, shard_index))
-
+  
   def shard_to_slice_indices(self, shard_index):
-    start = self.cumsum_rows[shard_index - 1] if shard_index > 0 else 0
-    end = self.cumsum_rows[shard_index]
+    start = self._cumsum_rows[shard_index - 1] if shard_index > 0 else 0
+    end = self._cumsum_rows[shard_index]
     return start, end
-
+  
   def load_slice(self, start, end):
     assert end > start, 'End index must be greater than start index'
-    assert start < self.cumsum_rows[-1], 'Start index is out of bounds'
-    i = (start < self.cumsum_rows).argmax()
-    j = (end <= self.cumsum_rows).argmax()
+    assert start < self._cumsum_rows[-1], 'Start index is out of bounds'
+    i = (start < self._cumsum_rows).argmax()
+    j = (end <= self._cumsum_rows).argmax()
     R = []
     for shard_index in range(i, j + 1):
       shard = self.load_shard(shard_index)
@@ -205,16 +239,27 @@ class ShardedLoader(LoaderInterface):
         start_offset = start
         end_offset = end
       else:
-        start_offset = start - self.cumsum_rows[shard_index - 1]
-        end_offset = end - self.cumsum_rows[shard_index - 1]
-
+        start_offset = start - self._cumsum_rows[shard_index - 1]
+        end_offset = end - self._cumsum_rows[shard_index - 1]
+      
       start_offset = max(0, start_offset)
       end_offset = min(shard.shape[0], end_offset)
-
+      
       R.append(shard[start_offset:end_offset])
-
+    
     return np.concatenate(R, 0)
 
+  def iter(self, offset=0):
+    for shard in range(self.num_shards):
+      a, b = self.shard_to_slice_indices(shard)
+      if offset >= a and offset < b:
+        break
+    while shard < self.num_shards:
+      for row in self.load_shard(shard):
+        yield offset, row
+        offset += 1
+      shard += 1
+  
 class MappingLoader(LoaderInterface):
   def __init__(self, loader: LoaderInterface, *mappings, width=None):
     super().__init__()
@@ -222,11 +267,12 @@ class MappingLoader(LoaderInterface):
     self._loader = loader
     self._mappings = mappings
 
-    self.dtype = loader.dtype
-    self.shape = tuple(self._apply(np.ones((1,) + loader.shape) * 0.5).shape[1:])
+    result = self._apply(loader.load_slice(0, 1))
+    self.dtype = result.dtype
+    self.shape = tuple(result.shape[1:])
     self.num_shards = loader.num_shards
-    self.num_rows = loader.num_rows    
-
+    self.num_rows = loader.num_rows
+  
   @lru_cache(maxsize=1)
   def load_shard(self, shard_index):
     return self._apply(self._loader.load_shard(shard_index))
@@ -236,11 +282,54 @@ class MappingLoader(LoaderInterface):
 
   def load_slice(self, start, end):
     return self._apply(self._loader.load_slice(start, end))
-
+  
   def _apply(self, x):
     for f in self._mappings:
       x = f(x)
     return x
+
+class Slice(LoaderInterface):
+  def __init__(self, tensor: LoaderInterface, start: int, end: int):
+    self._tensor = tensor
+    self._start = start
+    self._end = end
+
+    assert start >= 0, 'Start index must be non-negative'
+    assert end > start, 'End index must be greater than start index'
+    assert end <= tensor.num_rows, 'End index is out of bounds'
+
+    self._shard_start = 0
+    while tensor.shard_to_slice_indices(self._shard_start)[0] < start:
+      self._shard_start += 1
+
+    self._shard_end = 0
+    while tensor.shard_to_slice_indices(self._shard_end)[1] < end:
+      self._shard_end += 1
+    self._shard_end += 1
+    
+    self.dtype = tensor.dtype
+    self.shape = tensor.shape
+    self.num_shards = self._shard_end - self._shard_start
+    self.num_rows = end - start
+  
+  def load_shard(self, shard_index):
+    assert shard_index >= 0
+    assert shard_index < self.num_shards
+    return self._tensor.load_slice(*self.shard_to_slice_indices(shard_index))
+
+  def shard_to_slice_indices(self, shard_index):
+    i, j = self._tensor.shard_to_slice_indices(shard_index - self._shard_start)
+    if i < self._start:
+      i = self._start
+    if j > self._end:
+      j = self._end
+    return i - self._start, j - self._start
+
+  def load_slice(self, start, end):
+    assert start >= 0, 'Start index must be non-negative'
+    assert end > start, 'End index must be greater than start index'
+    assert end <= self.num_rows, f'End index is out of bounds ({end} <= {self.num_rows})'
+    return self._tensor.load_slice(start + self._start, end + self._start)
 
 class RowMapper(LoaderInterface):
   def __init__(self, f, *loaders):
@@ -256,7 +345,7 @@ class RowMapper(LoaderInterface):
     self.num_rows = loaders[0].num_rows
     for loader in loaders[1:]:
       assert loader.num_rows == self.num_rows, 'All loaders must have the same number of rows'
-
+  
   def load_shard(self, shard_index):
     indices = self._loaders[0].shard_to_slice_indices(shard_index)
     A = [
@@ -265,17 +354,19 @@ class RowMapper(LoaderInterface):
     for loader in self._loaders[1:]:
       A.append(loader.load_slice(*indices))
     return self._f(*A)
-
+  
   def shard_to_slice_indices(self, shard_index):
     return self._loaders[0].shard_to_slice_indices(shard_index)
-
+  
   def load_slice(self, start, end):
     A = [l.load_slice(start, end) for l in self._loaders]
     return self._f(*A)
 
 def _compute_innerproduct(loader1, loader2, offset):
+  print('_compute_innerproduct', offset)
   shard = loader1.load_shard(offset).astype(np.float32)
-  slice = loader2.load_slice(*loader1.shard_to_slice_indices(offset)).astype(np.float32)
+  i = loader1.shard_to_slice_indices(offset)
+  slice = loader2.load_slice(*i).astype(np.float32)
   return shard.T @ slice
 
 def _compute_weighted_innerproduct(loader1, loader2, weights_loader, offset):
@@ -297,6 +388,30 @@ def _compute_weighted_self_innerproduct(loader1, weights_loader, offset):
   weights = weights_loader.load_slice(*loader1.shard_to_slice_indices(offset)).astype(np.float32)
   A = A * weights
   return A.T @ A
+
+class curry:
+  def __init__(self, f, *args, **kwargs):
+    self._f = f
+    self._args = args
+    self._kwargs = kwargs
+  def __call__(self, *args, **kwargs):
+    return self._f(*(self._args + args), **(self._kwargs | kwargs))
+  
+class compose:
+  def __init__(self, *funcs):
+    self._funcs = funcs
+  def __call__(self, x):
+    for f in self._funcs:
+      x = f(x)
+    return x
+    
+def _matmul(a, b):
+  return a @ b
+
+def matmul(loader: LoaderInterface, matrix: np.ndarray, num_workers: int = 4):
+  _ = loader.load_slice(0, 1) @ matrix  # Test the operation is valid
+  shards = list(range(0, loader.num_shards))
+  return MappingLoader(loader, curry(_matmul, b=matrix))
 
 def compute_inner_product(loader1: LoaderInterface, loader2: LoaderInterface, weights_loader=None, num_workers: int = 4):
   assert loader1.num_rows == loader2.num_rows, 'Both loaders must have the same number of shards'
