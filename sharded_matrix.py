@@ -10,6 +10,7 @@ Source: https://github.com/evangambit/sharded-matrix
 import multiprocessing
 import os
 from functools import lru_cache
+from typing import Union
 
 import numpy as np
 
@@ -120,14 +121,19 @@ class ShardedWriter:
       return
   
   def _dump_data(self, num_rows):
-    with open(path2shardname(self.path, self.shard_index), 'wb') as f:
-      f.write(kType2ByteEncoding[self.dtype])
-      f.write(np.array(len(self.shape) + 1, dtype=np.int32).tobytes())
-      for d in (num_rows,) + self.shape:
-        f.write(np.array(d, dtype=np.int32).tobytes())
-      f.write(self._data_to_write[:num_rows*self.bytes_per_row])
+    self.write_shard(self.path, num_rows, self._data_to_write[:num_rows*self.bytes_per_row], self.dtype, self.shape, self.shard_index)
     self._i = 0
     self.shard_index += 1
+
+  @staticmethod
+  def write_shard(path: str, num_rows: int, data: bytes, dtype, shape: tuple[int], shard_index: int):
+    assert kType2SizeBits[dtype] * product(shape) * num_rows == len(data) * 8, f'Expected {kType2SizeBits[dtype] * product(shape) * num_rows} bits, got {len(data) * 8} bits'
+    with open(path2shardname(path, shard_index), 'wb') as f:
+      f.write(kType2ByteEncoding[dtype])
+      f.write(np.array(len(shape) + 1, dtype=np.int32).tobytes())
+      for d in (num_rows,) + shape:
+        f.write(np.array(d, dtype=np.int32).tobytes())
+      f.write(data)
 
 def _load_shard_header(f):
   dtype = f.read(4)
@@ -179,8 +185,20 @@ class LoaderInterface:
       start, end = self.shard_to_slice_indices(shard)
       result.append(end - start)
     return tuple(result)
-  
-  def save(self, path, force=None, dtype=None):
+
+  def _save_helper(self, shard_index: int, path: str, dtype):
+      print('Saving shard', shard_index)
+      shard = self.load_shard(shard_index).astype(dtype)
+      ShardedWriter.write_shard(
+        path=path,
+        num_rows=shard.shape[0],
+        data=shard.tobytes(),
+        dtype=dtype,
+        shape=shard.shape[1:],
+        shard_index=shard_index
+      )
+
+  def save(self, path, force=None, dtype=None, num_workers=4, batch_size=None):
     if dtype == None:
       dtype = self.dtype
     if not force:
@@ -191,9 +209,23 @@ class LoaderInterface:
         os.remove(path2shardname(path, i))
         i += 1
     
-    with ShardedWriter(path, shape=self.shape, dtype=dtype) as w:
-      for shard in range(self.num_shards):
-        w.write_many(self.load_shard(shard))
+    if num_workers <= 1:
+      with ShardedWriter(path, shape=self.shape, dtype=dtype) as w:
+        if batch_size is None:
+          for shard in np.arange(self.num_shards):
+            w.write_many(self.load_shard(shard))
+        else:
+          for i in np.arange(0, self.num_rows, batch_size):
+            x = self.load_slice(i, min(i + batch_size, self.num_rows))
+            w.write_many(x)
+      return
+
+    # For every self.shard, load it and write it to the new path using ShardedWriter.write_shard
+    with multiprocessing.get_context('spawn').Pool(num_workers) as pool:
+      pool.starmap(
+        self._save_helper,
+        [(i, path, dtype) for i in range(self.num_shards)]
+      )
     
 
 class ShardedLoader(LoaderInterface):
@@ -274,13 +306,13 @@ class MappingLoader(LoaderInterface):
     self.num_rows = loader.num_rows
   
   @lru_cache(maxsize=1)
-  def load_shard(self, shard_index):
+  def load_shard(self, shard_index: int):
     return self._apply(self._loader.load_shard(shard_index))
 
-  def shard_to_slice_indices(self, shard_index):
+  def shard_to_slice_indices(self, shard_index: int):
     return self._loader.shard_to_slice_indices(shard_index)
 
-  def load_slice(self, start, end):
+  def load_slice(self, start: int, end: int):
     return self._apply(self._loader.load_slice(start, end))
   
   def _apply(self, x):
@@ -363,13 +395,17 @@ class RowMapper(LoaderInterface):
     return self._f(*A)
 
 def _compute_innerproduct(loader1, loader2, offset):
-  print('_compute_innerproduct', offset)
+  print(offset, 'start')
   shard = loader1.load_shard(offset).astype(np.float32)
   i = loader1.shard_to_slice_indices(offset)
+  print(offset, 'loading slice', i)
   slice = loader2.load_slice(*i).astype(np.float32)
-  return shard.T @ slice
+  r = shard.T @ slice
+  print(offset, 'end')
+  return r
 
-def _compute_weighted_innerproduct(loader1, loader2, weights_loader, offset):
+def _compute_weighted_innerproduct(loader1: LoaderInterface, loader2: LoaderInterface, weights_loader: LoaderInterface, offset: int):
+  print('_compute_weighted_innerproduct', offset)
   shard = loader1.load_shard(offset).astype(np.float32)
   indices = loader1.shard_to_slice_indices(offset)
   slice = loader2.load_slice(*indices).astype(np.float32)
@@ -379,11 +415,13 @@ def _compute_weighted_innerproduct(loader1, loader2, weights_loader, offset):
   slice = slice * weights
   return shard.T @ slice
 
-def _compute_self_innerproduct(loader1, offset):
+def _compute_self_innerproduct(loader1: LoaderInterface, offset: int):
+  print('_compute_self_innerproduct', offset)
   A = loader1.load_shard(offset).astype(np.float32)
   return A.T @ A
 
-def _compute_weighted_self_innerproduct(loader1, weights_loader, offset):
+def _compute_weighted_self_innerproduct(loader1: LoaderInterface, weights_loader: LoaderInterface, offset: int):
+  print('_compute_weighted_self_innerproduct', offset)
   A = loader1.load_shard(offset).astype(np.float32)
   weights = weights_loader.load_slice(*loader1.shard_to_slice_indices(offset)).astype(np.float32)
   A = A * weights
@@ -405,12 +443,12 @@ class compose:
       x = f(x)
     return x
     
+
 def _matmul(a, b):
   return a @ b
 
-def matmul(loader: LoaderInterface, matrix: np.ndarray, num_workers: int = 4):
+def matmul(loader: LoaderInterface, matrix: np.ndarray):
   _ = loader.load_slice(0, 1) @ matrix  # Test the operation is valid
-  shards = list(range(0, loader.num_shards))
   return MappingLoader(loader, curry(_matmul, b=matrix))
 
 def compute_inner_product(loader1: LoaderInterface, loader2: LoaderInterface, weights_loader=None, num_workers: int = 4):
@@ -423,7 +461,7 @@ def compute_inner_product(loader1: LoaderInterface, loader2: LoaderInterface, we
 
   shards = list(range(0, loader1.num_shards))
   result = None
-  with multiprocessing.Pool(num_workers) as pool:
+  with multiprocessing.get_context('spawn').Pool(num_workers) as pool:
     if loader1 is loader2:
       if weights_loader is None:
         inner_products = pool.starmap(_compute_self_innerproduct, [(loader1, offset) for offset in shards])
@@ -434,19 +472,22 @@ def compute_inner_product(loader1: LoaderInterface, loader2: LoaderInterface, we
         inner_products = pool.starmap(_compute_innerproduct, [(loader1, loader2, offset) for offset in shards])
       else:
         inner_products = pool.starmap(_compute_weighted_innerproduct, [(loader1, loader2, weights_loader, offset) for offset in shards])
-    result = sum(inner_products)
+    result = sum([x.astype(np.float64) for x in inner_products])
 
     if should_transpose:
       result = result.T
     return result
 
-def linear_regression(X: LoaderInterface, Y: LoaderInterface, weights=None, regularization: float = 0.0, num_workers: int = 4):
+def linear_regression(X: LoaderInterface, Y: LoaderInterface, weights: LoaderInterface = None, regularization: Union[float|np.ndarray] = 0.0, num_workers: int = 4):
   assert len(X.shape) == 1
   assert len(Y.shape) == 1
+  if isinstance(regularization, np.ndarray):
+    assert len(regularization.shape) == 1
+    assert regularization.shape[0] == X.shape[0]
+  else:
+    regularization = np.ones(X.shape[0]) * regularization
   assert X.num_rows == Y.num_rows
   assert num_workers > 0
-  cov = compute_inner_product(X, X, num_workers=num_workers)
-  if regularization > 0.0:
-    cov += np.eye(cov.shape[0]) * regularization
+  cov = compute_inner_product(X, X, weights_loader=weights, num_workers=num_workers)
   dot_product = compute_inner_product(X, Y, weights_loader=weights, num_workers=num_workers)
-  return np.linalg.solve(cov, dot_product)
+  return np.linalg.solve(cov + np.diag(regularization), dot_product), cov, dot_product
